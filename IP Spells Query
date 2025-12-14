@@ -1,0 +1,148 @@
+WITH WardOnAdmission AS (
+    SELECT
+        ActivityIDSpell,
+        WardName AS WardOnAdmission,
+        WardMnemonic AS WardCodeAdmission
+    FROM [SourceDB].[Schema].[Vw_WardStay]
+    WHERE WardStayNumber = 1
+),
+WardOnDischarge AS (
+    SELECT
+        ws.ActivityIDSpell,
+        ws.WardName AS WardOnDischarge,
+        ws.WardMnemonic AS WardCodeDischarge
+    FROM [SourceDB].[Schema].[Vw_WardStay] ws
+    INNER JOIN (
+        SELECT ActivityIDSpell, MAX(WardStayNumber) AS MaxStay
+        FROM [SourceDB].[Schema].[Vw_WardStay]
+        GROUP BY ActivityIDSpell
+    ) lastStay 
+        ON ws.ActivityIDSpell = lastStay.ActivityIDSpell
+       AND ws.WardStayNumber = lastStay.MaxStay
+),
+
+-- CTE for Special Indicators / Consents
+FilteredCDQ AS (
+    SELECT 
+        Q.PatientID,
+        Q.QueryResponse,
+        G.ElementResponse,
+        ROW_NUMBER() OVER (
+            PARTITION BY Q.PatientID 
+            ORDER BY Q.QueryResponse
+        ) AS rn
+    FROM [SourceDB].[Schema].[Fact_CustomQueries] Q
+    INNER JOIN [SourceDB].[Schema].[Dim_GroupElements] G
+        ON G.GroupResponseID = Q.GroupResponseID
+       AND G.ElementID = Q.QueryResponse
+    WHERE Q.GroupResponseID = 'REG.DATAOPTIONS'
+      AND Q.QueryResponse IN ('DATA.RESEA','DATA.SERV')
+)
+
+-- Main Dataset
+SELECT
+    LEFT(A.VisitID,2) AS [Trust],
+    P.HealthCareNumber AS [NHSNumber],
+    P.PatientID,
+    P.NameFirst,
+    P.NameLast,
+    D.LanguageID AS [PreferredSpokenLanguage],
+    CONVERT(varchar(19), P.Birthdate, 103) AS [PatientDateOfBirth],
+    CONVERT(varchar(19), P.DateOfDeath, 103) AS [PatientDateOfDeath],
+
+    EC.EmergencyContactNames,
+    PH.AllPhoneNumbers,
+    ECP.EmergencyContact,
+
+    CASE 
+        WHEN P.Birthdate IS NOT NULL AND A.AdmitDateTime IS NOT NULL
+        THEN [SourceDB].[dbo].[Fn_CalculateAge](P.Birthdate, A.AdmitDateTime)
+    END AS [AgeAtAdmission],
+
+    CASE 
+        WHEN P.Birthdate IS NULL OR A.AdmitDateTime IS NULL THEN 'Unknown'
+        WHEN [SourceDB].[dbo].[Fn_CalculateAge](P.Birthdate, A.AdmitDateTime) BETWEEN 0 AND 17 THEN '0-17'
+        WHEN [SourceDB].[dbo].[Fn_CalculateAge](P.Birthdate, A.AdmitDateTime) BETWEEN 18 AND 64 THEN '18-64'
+        ELSE '65+'
+    END AS [AgeBand],
+
+    CONCAT(Addr.Address1,' ',Addr.Address2,' ',Addr.City) AS [PatientAddress],
+    Addr.PostCode,
+
+    SI.SIList AS [PatientSpecialIndicators],
+
+    GP.PractitionerName AS [PatientGP],
+    GP.PractitionerCode AS [PatientGPCode],
+    GPAddr.FullAddress AS [PatientGPAddress],
+
+    CASE WHEN CDQ.ElementResponse = 'Research/Trials' THEN 'Yes' ELSE 'No' END AS [ResearchConsent],
+    CASE WHEN CDQ.ElementResponse = 'Service Improvement' THEN 'Yes' ELSE 'No' END AS [ServiceImprovementConsent],
+
+    A.AdmitDateTime,
+    Dchg.DischargeDateTime,
+
+    ROUND(
+        CAST(Dchg.DischargeDateTime AS FLOAT) 
+      - CAST(A.AdmitDateTime AS FLOAT), 2
+    ) AS [LengthOfStayDays],
+
+    CASE
+        WHEN DATEDIFF(DAY, A.AdmitDateTime, Dchg.DischargeDateTime) BETWEEN 7 AND 13 THEN 'Long Stay'
+        WHEN DATEDIFF(DAY, A.AdmitDateTime, Dchg.DischargeDateTime) BETWEEN 14 AND 21 THEN 'Stranded'
+        WHEN DATEDIFF(DAY, A.AdmitDateTime, Dchg.DischargeDateTime) > 21 THEN 'Super Stranded'
+        ELSE 'Less than 7 days'
+    END AS [LengthOfStayBand],
+
+    w1.WardCodeAdmission,
+    w1.WardOnAdmission,
+    w2.WardCodeDischarge,
+    w2.WardOnDischarge,
+
+    CASE 
+        WHEN w2.WardCodeDischarge LIKE '%.DIS' THEN 'Discharge Lounge'
+        WHEN w2.WardCodeDischarge LIKE '%.VW' THEN 'Virtual Ward'
+        ELSE 'Not a Special Category'
+    END AS [WardSpecialCategory]
+
+FROM [SourceDB].[Schema].[Fact_Admissions] A
+LEFT JOIN [SourceDB].[Schema].[Dim_Patient] P ON P.VisitID = A.VisitID
+LEFT JOIN [SourceDB].[Schema].[Fact_Discharge] Dchg ON Dchg.VisitID = A.VisitID
+LEFT JOIN [SourceDB].[Schema].[Dim_PatientDetails] D ON D.PatientID = P.PatientID
+LEFT JOIN [SourceDB].[Schema].[Dim_Address] Addr ON Addr.PatientID = P.PatientID
+LEFT JOIN [SourceDB].[Schema].[Dim_GP] GP ON GP.VisitID = A.VisitID
+LEFT JOIN [SourceDB].[Schema].[Dim_GPAddress] GPAddr ON GPAddr.GPID = GP.GPID
+LEFT JOIN WardOnAdmission w1 ON w1.ActivityIDSpell = A.VisitID
+LEFT JOIN WardOnDischarge w2 ON w2.ActivityIDSpell = A.VisitID
+LEFT JOIN FilteredCDQ CDQ ON CDQ.PatientID = P.PatientID AND CDQ.rn = 1
+
+LEFT JOIN (
+    SELECT PatientID,
+           STRING_AGG(Name, ', ') AS SIList
+    FROM [SourceDB].[Schema].[Fact_SpecialIndicators]
+    GROUP BY PatientID
+) SI ON SI.PatientID = P.PatientID
+
+LEFT JOIN (
+    SELECT PatientID,
+           STRING_AGG(ContactName, '; ') AS EmergencyContactNames
+    FROM [SourceDB].[Schema].[Fact_EmergencyContacts]
+    GROUP BY PatientID
+) EC ON EC.PatientID = P.PatientID
+
+LEFT JOIN (
+    SELECT PatientID,
+           STRING_AGG(PhoneNumber, '; ') AS EmergencyContact
+    FROM [SourceDB].[Schema].[Fact_ContactPhones]
+    GROUP BY PatientID
+) ECP ON ECP.PatientID = P.PatientID
+
+LEFT JOIN (
+    SELECT PatientID,
+           STRING_AGG(PhoneNumber, '; ') AS AllPhoneNumbers
+    FROM [SourceDB].[Schema].[Fact_PhoneNumbers]
+    GROUP BY PatientID
+) PH ON PH.PatientID = P.PatientID
+
+WHERE A.RegistrationType = 'IN';
+
+GO
