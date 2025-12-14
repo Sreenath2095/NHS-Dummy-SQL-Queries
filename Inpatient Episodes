@@ -1,0 +1,100 @@
+SELECT
+    --EventFacts.Room,
+    NameLast --for testing
+   ,AAP.AbstractingAttendingProviderEffectiveDateTimeID AS EpisodeID
+   ,RM.VisitID AS ActivityIDSpell
+   ,HM.EmrNumber AS EMRNumber
+   ,MRN.PrefixMedicalRecordNumber AS PatientLocalMRN
+   ,DATEDIFF(YEAR, HM.Birthdate, AAP.AbstractingAttendingProviderEffectiveDateTimeID)
+     - CASE
+           WHEN DATEADD(
+                    YEAR,
+                    DATEDIFF(YEAR, HM.Birthdate, AAP.AbstractingAttendingProviderEffectiveDateTimeID),
+                    HM.Birthdate
+                ) > AAP.AbstractingAttendingProviderEffectiveDateTimeID
+           THEN 1
+           ELSE 0
+       END AS AgeatStartofEpisode
+   ,ROW_NUMBER() OVER (
+        PARTITION BY RM.VisitID
+        ORDER BY AAP.AbstractingAttendingProviderEffectiveDateTimeID ASC
+    ) AS EpisodeNumber
+
+   ,CAST(AAP.AbstractingAttendingProviderEffectiveDateTimeID AS DATE) AS EpisodeStartDate
+   ,CAST(AAP.AbstractingAttendingProviderEffectiveDateTimeID AS TIME(0)) AS EpisodeStartTime
+   ,AAP.AbstractingAttendingProviderEffectiveDateTimeID AS EpisodeStartDateTime
+   ,AAP.AbstractingAttendingProvider_UnvUserID AS LeadClinicianIDLink
+   ,EpisodeClinician.UnvUserID AS ConsultantMnemonic
+   ,EpisodeClinician.NameStored AS ConsultantName
+   ,EpisodeClinicianMainSpecialtyID.ProviderSpecialty_MisSpecID AS MainSpecialtyIDLink
+   ,EpisodeClinicianMainSpecialty.Mnemonic AS MainSpecialtyMnemonic
+   ,EpisodeClinicianMainSpecialty.Name AS MainSpecialtyName
+   ,EV.Room AS FacilitiesIDLink
+   ,LOC.Mnemonic AS StartofEpisodeWardMnemonic
+   ,LOC.Name AS StartofEpisodeWardName
+   ,CAST(
+        COALESCE(
+            AAP.UkAbstractingAttendingProviderEndDateTime,
+            RT.RegistrationTypeDischargeDateTime,
+            '2100-12-31 23:59:59'
+        ) AS DATE
+    ) AS EpisodeEndDate
+
+   ,CAST(
+        COALESCE(
+            AAP.UkAbstractingAttendingProviderEndDateTime,
+            RT.RegistrationTypeDischargeDateTime,
+            '2100-12-31 23:59:59'
+        ) AS TIME(0)
+    ) AS EpisodeEndTime
+
+   ,COALESCE(
+        AAP.UkAbstractingAttendingProviderEndDateTime,
+        RT.RegistrationTypeDischargeDateTime,
+        '2100-12-31 23:59:59'
+    ) AS EpisodeEndDateTime
+
+FROM [SourceDB].[Schema].[Fact_Registrations] RM                              -- Main registration table
+
+LEFT JOIN [SourceDB].[Schema].[Fact_ConsultantEpisodes] AAP
+       ON AAP.VisitID = RM.VisitID                                            -- Consultant episodes
+
+LEFT JOIN [SourceDB].[Schema].[Fact_RegistrationTypes] RT
+       ON RT.VisitID = RM.VisitID                                             -- Discharge-related data
+
+LEFT JOIN [SourceDB].[Schema].[Fact_Events] EV
+       ON EV.VisitID = AAP.VisitID
+      AND EV.EffectiveDateTime = AAP.AbstractingAttendingProviderEffectiveDateTimeID
+                                                                             -- Ward stays / events
+
+LEFT JOIN [SourceDB].[Schema].[Ref_RegistrationTypes] RTM
+       ON RTM.RegistrationTypeID = RM.RegistrationTypeID                      -- Activity class
+
+LEFT JOIN [SourceDB].[Schema].[Dim_ProviderNames] AS EpisodeClinician
+       ON EpisodeClinician.UnvUserID = AAP.AbstractingAttendingProvider_UnvUserID
+                                                                             -- Clinician details
+
+LEFT JOIN [SourceDB].[Schema].[Dim_ProviderSpecialties] AS EpisodeClinicianMainSpecialtyID
+       ON EpisodeClinicianMainSpecialtyID.UnvUserID = EpisodeClinician.UnvUserID
+      AND EpisodeClinicianMainSpecialtyID.ProviderSpecialtyPrimary = N'Y'
+                                                                             -- Main specialty ID
+
+LEFT JOIN [SourceDB].[Schema].[Ref_Specialties] AS EpisodeClinicianMainSpecialty
+       ON EpisodeClinicianMainSpecialty.SpecialtyID =
+          EpisodeClinicianMainSpecialtyID.ProviderSpecialty_MisSpecID
+                                                                             -- Specialty lookup
+
+LEFT JOIN [SourceDB].[Schema].[Ref_Rooms] RMN
+       ON RMN.RoomID = EV.Room                                                -- Rooms
+
+LEFT JOIN [SourceDB].[Schema].[Ref_Locations] LOC
+       ON LOC.LocationID = RMN.LocationID                                     -- Wards
+
+INNER JOIN [SourceDB].[Schema].[Dim_Patients] HM
+        ON HM.PatientID = RM.PatientID                                        -- Patient details
+
+INNER JOIN [SourceDB].[Schema].[Dim_PatientMRNs] MRN
+        ON MRN.PatientID = HM.PatientID                                       -- Medical record numbers
+
+ORDER BY
+    RM.VisitID;
